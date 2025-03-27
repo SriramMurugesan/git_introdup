@@ -1,0 +1,10 @@
+torch
+transformers
+sentence-transformers
+faiss-cpu
+flask
+python-docx
+PyPDF2
+datasets
+scikit-learn
+nltk
