@@ -2,9 +2,12 @@ torch
 transformers
 sentence-transformers
 faiss-cpu
+fastapi
+uvicorn
 flask
 python-docx
 PyPDF2
 datasets
 scikit-learn
 nltk
+python-multipart
