@@ -1,144 +1,198 @@
 import os
 import PyPDF2
 import docx
-import nltk
 from typing import Dict, Any, List
 from transformers import pipeline
 from sentence_transformers import SentenceTransformer
-import faiss
 import numpy as np
 import torch
-
-# Download required NLTK data
-nltk.download('punkt')
+import chromadb
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+import spacy
+import pandas as pd
+from tqdm import tqdm
 
 class FinancialDocumentProcessor:
     def __init__(self):
-        # Initialize NER pipeline with FinBERT
-        self.ner_pipeline = pipeline("ner", model="ProsusAI/finbert")
+        # Initialize financial NER pipeline with a model specifically trained for financial entities
+        self.ner_pipeline = pipeline(
+            "token-classification",
+            model="yiyanghkust/finbert",
+            aggregation_strategy="simple"
+        )
         
         # Initialize sentence transformer for embeddings
         self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Load financial concepts and create FAISS index
-        self.concepts = self._load_financial_concepts()
-        self.concept_embeddings = self.sentence_model.encode(self.concepts)
-        self.index = faiss.IndexFlatL2(self.concept_embeddings.shape[1])
-        self.index.add(self.concept_embeddings)
-
-    def _load_financial_concepts(self) -> List[str]:
-        """Load predefined financial concepts"""
-        return [
-            "revenue", "profit margin", "operating income",
-            "net income", "earnings per share", "EBITDA",
-            "cash flow", "balance sheet", "income statement",
-            "assets", "liabilities", "equity",
-            "market capitalization", "dividend yield", "P/E ratio",
-            "debt-to-equity", "working capital", "ROI",
-            "ROE", "ROA", "gross margin",
-            "operating margin", "net margin", "current ratio",
-            "quick ratio", "inventory turnover", "accounts receivable",
-            "accounts payable", "capital expenditure", "depreciation"
-        ]
-
-    def extract_text_from_pdf(self, file_path: str) -> str:
-        """Extract text from a PDF file"""
-        text = ""
-        with open(file_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            for page in reader.pages:
-                text += page.extract_text() + "\n"
-        return text
-
-    def extract_text_from_docx(self, file_path: str) -> str:
-        """Extract text from a DOCX file"""
-        doc = docx.Document(file_path)
-        return "\n".join([paragraph.text for paragraph in doc.paragraphs])
-
-    def extract_text(self, file_path: str) -> str:
-        """Extract text from a document based on its file type"""
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext == '.pdf':
-            return self.extract_text_from_pdf(file_path)
-        elif ext == '.docx':
-            return self.extract_text_from_docx(file_path)
-        elif ext == '.txt':
-            with open(file_path, 'r', encoding='utf-8') as file:
-                return file.read()
-        else:
-            raise ValueError(f"Unsupported file type: {ext}")
-
-    def split_into_sections(self, text: str, max_length: int = 512) -> List[str]:
-        """Split text into manageable sections"""
-        sentences = nltk.sent_tokenize(text)
-        sections = []
-        current_section = ""
+        # Initialize financial sentiment classifier
+        self.sentiment_model = torch.hub.load("yiyanghkust/finbert-tone", map_location=torch.device('cuda'))
+        self.sentiment_tokenizer = torch.hub.load("yiyanghkust/finbert-tone", map_location=torch.device('cuda'))
         
-        for sentence in sentences:
-            if len(current_section) + len(sentence) < max_length:
-                current_section += sentence + " "
-            else:
-                if current_section:
-                    sections.append(current_section.strip())
-                current_section = sentence + " "
+        # Initialize Chroma vector store
+        self.chroma_client = chromadb.Client()
+        self.collection = self.chroma_client.create_collection("financial_documents")
         
-        if current_section:
-            sections.append(current_section.strip())
+        # Initialize text splitter for RAG
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=512,
+            chunk_overlap=50,
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
+        )
         
-        return sections
+        # Load spaCy model for additional NLP tasks
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except:
+            os.system("python -m spacy download en_core_web_sm")
+            self.nlp = spacy.load("en_core_web_sm")
+        
+        # Financial taxonomy
+        self.taxonomy = {
+            'financial_metrics': ['revenue', 'profit', 'margin', 'ebitda', 'eps', 'roa', 'roe'],
+            'risk_factors': ['risk', 'uncertainty', 'liability', 'debt', 'exposure'],
+            'market_terms': ['market', 'industry', 'sector', 'competition', 'trend'],
+            'regulatory': ['compliance', 'regulation', 'law', 'requirement', 'policy']
+        }
 
-    def process_section(self, text: str) -> Dict[str, Any]:
-        """Process a single section of text"""
-        # Named Entity Recognition
+    def process_text(self, text: str) -> List[str]:
+        # Process text through NER pipeline
         ner_results = self.ner_pipeline(text)
         
-        # Convert numpy float32 to regular Python float for JSON serialization
-        ner_results = [{
-            **{k: float(v) if isinstance(v, (torch.Tensor, np.float32)) else v 
-               for k, v in entity.items()}
-        } for entity in ner_results]
-        
-        # Get document embedding and find similar concepts
-        document_embedding = self.sentence_model.encode([text], convert_to_tensor=True)
-        _, indices = self.index.search(document_embedding.cpu().detach().numpy(), k=3)
-        relevant_concepts = [self.concepts[i] for i in indices[0]]
-        
-        return {
-            'text': text,
-            'named_entities': ner_results,
-            'relevant_concepts': relevant_concepts
+        # Map label indices to meaningful entity types
+        entity_map = {
+            'LABEL_0': 'ORG',  # Organization
+            'LABEL_1': 'MONEY',  # Monetary value
+            'LABEL_2': 'DATE',  # Date
+            'LABEL_3': 'PERCENT'  # Percentage
         }
-
-    def process_text(self, text: str) -> Dict[str, Any]:
-        """Process a single piece of text"""
-        return self.process_section(text)
+        
+        # Format results in desired way
+        output_lines = []
+        for entity in ner_results:
+            if entity['score'] > 0.5:  # Filter low confidence predictions
+                entity_type = entity_map.get(entity['entity'], entity['entity'])
+                output_line = f"Text: {entity['word']}, Entity: {entity_type}, Score: {entity['score']:.2f}"
+                output_lines.append(output_line)
+        
+        return output_lines
 
     def process_document(self, file_path: str) -> Dict[str, Any]:
-        """Process an entire document"""
-        # Extract text from document
-        text = self.extract_text(file_path)
+        """Process a document and extract financial information using RAG."""
+        try:
+            text = self._extract_text(file_path)
+        except Exception as e:
+            return {'error': str(e)}
         
-        # Split into sections
-        sections = self.split_into_sections(text)
+        chunks = self.text_splitter.split_text(text)
         
-        # Process each section
-        processed_sections = [self.process_section(section) for section in sections]
+        # Store chunks in vector store
+        try:
+            embeddings = [self.sentence_model.encode(chunk) for chunk in tqdm(chunks)]
+            self.collection.add(
+                embeddings=embeddings,
+                documents=chunks,
+                ids=[f"chunk_{i}" for i in range(len(chunks))]
+            )
+        except Exception as e:
+            return {'error': str(e)}
         
-        # Collect unique concepts and total entities
-        all_concepts = set()
-        total_entities = 0
-        for section in processed_sections:
-            all_concepts.update(section['relevant_concepts'])
-            total_entities += len(section['named_entities'])
+        # Extract financial entities
+        entities = []
+        for chunk in chunks:
+            ner_results = self.ner_pipeline(chunk)
+            entities.extend(ner_results)
         
-        # Create document summary
-        summary = {
-            'total_sections': len(sections),
-            'total_entities': total_entities,
-            'unique_concepts': list(all_concepts)
-        }
+        # Classify document sections
+        classified_sections = self._classify_sections(chunks)
+        
+        # Extract key financial metrics
+        metrics = self._extract_financial_metrics(text)
+        
+        # Perform sentiment analysis
+        sentiment = self._analyze_sentiment(text)
         
         return {
-            'summary': summary,
-            'sections': processed_sections
+            'entities': entities,
+            'classified_sections': classified_sections,
+            'metrics': metrics,
+            'sentiment': sentiment,
+            'chunks': len(chunks)
+        }
+    
+    def query_document(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
+        """Query the document using RAG."""
+        try:
+            query_embedding = self.sentence_model.encode(query)
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=k
+            )
+            return results
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def _extract_text(self, file_path: str) -> str:
+        """Extract text from PDF or DOCX files."""
+        if file_path.endswith('.pdf'):
+            with open(file_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                text = ' '.join([page.extract_text() for page in reader.pages])
+        elif file_path.endswith('.docx'):
+            doc = docx.Document(file_path)
+            text = ' '.join([paragraph.text for paragraph in doc.paragraphs])
+        else:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                text = file.read()
+        return text
+    
+    def _classify_sections(self, chunks: List[str]) -> List[Dict[str, Any]]:
+        """Classify document sections based on the financial taxonomy."""
+        classified_sections = []
+        for chunk in chunks:
+            section_types = {}
+            doc = self.nlp(chunk.lower())
+            
+            for category, terms in self.taxonomy.items():
+                matches = sum(1 for term in terms if term in doc.text)
+                if matches > 0:
+                    section_types[category] = matches
+            
+            if section_types:
+                classified_sections.append({
+                    'text': chunk,
+                    'classifications': section_types
+                })
+        
+        return classified_sections
+    
+    def _extract_financial_metrics(self, text: str) -> Dict[str, Any]:
+        """Extract key financial metrics using spaCy's pattern matching."""
+        doc = self.nlp(text)
+        metrics = {
+            'currency_amounts': [],
+            'percentages': [],
+            'dates': []
+        }
+        
+        for ent in doc.ents:
+            if ent.label_ == 'MONEY':
+                metrics['currency_amounts'].append(ent.text)
+            elif ent.label_ == 'PERCENT':
+                metrics['percentages'].append(ent.text)
+            elif ent.label_ == 'DATE':
+                metrics['dates'].append(ent.text)
+        
+        return metrics
+    
+    def _analyze_sentiment(self, text: str) -> Dict[str, float]:
+        """Analyze financial sentiment of the text."""
+        inputs = self.sentiment_tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        outputs = self.sentiment_model(**inputs)
+        probabilities = torch.softmax(outputs.logits, dim=1)
+        
+        return {
+            'positive': float(probabilities[0][0]),
+            'negative': float(probabilities[0][1]),
+            'neutral': float(probabilities[0][2])
         }

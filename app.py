@@ -1,118 +1,100 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
-from typing import Optional
-from financial_processor import FinancialDocumentProcessor
-import os
-import torch
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-import uvicorn
+from flask import Flask, render_template, request, jsonify
+import re
 
-app = FastAPI(title="Financial Document Analysis")
+app = Flask(__name__)
 
-# Create directories if they don't exist
-os.makedirs("static", exist_ok=True)
-os.makedirs("templates", exist_ok=True)
-os.makedirs("uploads", exist_ok=True)
-
-# Mount static files and setup templates
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
-
-# Initialize the financial processor
-processor = FinancialDocumentProcessor()
-
-ALLOWED_EXTENSIONS = {'txt', 'pdf', 'docx'}
-
-def allowed_file(filename: str) -> bool:
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-# Load models globally
-model_name = "yiyanghkust/finbert-pretrain"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForTokenClassification.from_pretrained(model_name)
-ner_pipeline = pipeline("ner", model=model, tokenizer=tokenizer)
-sentence_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# Financial concepts for RAG
-concepts = ["Net Revenue", "Net Profit Margin", "Balance Sheet", "Cash Flow"]
-concept_embeddings = sentence_model.encode(concepts, convert_to_tensor=True)
-
-# Build FAISS Index for Retrieval
-index = faiss.IndexFlatL2(concept_embeddings.shape[1])
-index.add(concept_embeddings.cpu().detach().numpy())
-
-class TextRequest(BaseModel):
-    text: str
-
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-@app.post("/analyze_text")
-async def analyze_text(text_request: TextRequest):
-    text = text_request.text
+def extract_financial_entities(text):
+    entities = []
     
-    if not text:
-        raise HTTPException(status_code=400, detail="No text provided")
+    # Enhanced patterns for Indian financial entities
+    patterns = {
+        'ORG': [
+            # Indian companies with common suffixes
+            r'[A-Z][a-zA-Z\s&]+(?:Ltd\.|Limited|Pvt\.|Private|Corporation|Company|Co\.|Group|Holdings|Technologies|Tech|Solutions|Industries|Enterprises)',
+            # BSE/NSE stock symbols
+            r'(?:BSE|NSE):[A-Z]{1,10}\b',  # e.g., BSE:RELIANCE, NSE:TCS
+            r'(?:NIFTY|SENSEX)(?:\s*50)?\b',
+            # Common Indian company abbreviations
+            r'\b(?:TCS|HDFC|SBI|ICICI|ONGC|ITC|L&T|M&M|BHEL|NTPC|SAIL)\b'
+        ],
+        'MONEY': [
+            # Rupee amounts with symbols and words
+            r'(?:₹|Rs\.|INR|Rupees?)\s*\d+(?:,\d{2,3})*(?:\.\d+)?(?:\s*(?:lakhs?|crores?|L|Cr|k|mn|bn))?\b',
+            # Amounts in lakhs/crores
+            r'\d+(?:,\d{2,3})*(?:\.\d+)?\s*(?:lakhs?|crores?|L|Cr)\b',
+            # Revenue/profit amounts in Indian format
+            r'(?:revenue|profit|loss|earnings|EBITDA|income|debt|assets|liabilities|turnover)\s+of\s+(?:₹|Rs\.|INR)\s*\d+(?:,\d{2,3})*(?:\.\d+)?(?:\s*(?:lakhs?|crores?|L|Cr))?\b'
+        ],
+        'DATE': [
+            # Years
+            r'\b(?:19|20)\d{2}\b',
+            # Indian fiscal year format
+            r'FY\d{2}(?:-\d{2})?\b',  # e.g., FY23, FY23-24
+            r'(?:Q[1-4]|H[12])\s*FY\d{2}(?:-\d{2})?\b',  # e.g., Q1 FY23
+            # Quarters with years
+            r'(?:Q[1-4]|first quarter|second quarter|third quarter|fourth quarter)(?:\s+of)?\s+(?:19|20)\d{2}',
+            # Indian months
+            r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+(?:19|20)\d{2}'
+        ],
+        'PERCENT': [
+            # Percentage values
+            r'\d+(?:\.\d+)?%',
+            # Growth/decline rates
+            r'(?:increase|decrease|growth|decline|up|down|rose|fell|gained|lost|jumped|plunged)\s+(?:by\s+)?\d+(?:\.\d+)?%',
+            # YoY and QoQ growth
+            r'\d+(?:\.\d+)?%\s+(?:YoY|QoQ|year-on-year|quarter-on-quarter)',
+            # Percentage points and basis points
+            r'\d+(?:\.\d+)?\s+(?:percentage points|basis points|bps)'
+        ],
+        'METRIC': [
+            # Indian financial metrics
+            r'(?:P/E ratio|EPS|ROI|ROE|ROA|CAGR|margin|PAT|PBT|NPA|CASA ratio)\s*(?:of)?\s*\d+(?:\.\d+)?',
+            # Market terms
+            r'(?:market cap|market value|valuation|mcap)\s+of\s+(?:₹|Rs\.|INR)\s*\d+(?:,\d{2,3})*(?:\.\d+)?(?:\s*(?:lakhs?|crores?|L|Cr))?\b',
+            # Indian banking terms
+            r'(?:NPA|CASA|CRR|SLR|PLR|NBFC)\s*(?:ratio|rate)?\s*(?:of)?\s*\d+(?:\.\d+)?%?'
+        ],
+        'REGULATOR': [
+            # Indian regulatory bodies and exchanges
+            r'\b(?:RBI|SEBI|NSE|BSE|IRDAI|PFRDA|NABARD|SIDBI)\b',
+            # Government bodies
+            r'\b(?:Ministry of Finance|MoF|GST Council|Income Tax Department|IT Dept)\b'
+        ]
+    }
     
-    try:
-        # Perform NER
-        ner_results = ner_pipeline(text)
-        
-        # Get document embedding and search for relevant concepts
-        document_embedding = sentence_model.encode([text], convert_to_tensor=True)
-        _, indices = index.search(document_embedding.cpu().detach().numpy(), k=2)
-        retrieved_concepts = [concepts[i] for i in indices[0]]
-        
-        return {
-            "original_text": text,
-            "named_entities": [{
-                **{k: float(v) if isinstance(v, (torch.Tensor, np.float32)) else v 
-                   for k, v in entity.items()}
-            } for entity in ner_results],
-            "retrieved_concepts": retrieved_concepts
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Process each pattern category
+    for entity_type, pattern_list in patterns.items():
+        for pattern in pattern_list:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                # Get the matched text and clean it up
+                matched_text = match.group().strip()
+                # Assign confidence scores based on pattern reliability
+                score = 0.99 if entity_type in ['MONEY', 'PERCENT'] else 0.95
+                
+                entities.append({
+                    "text": matched_text,
+                    "entity": entity_type,
+                    "score": score
+                })
+    
+    # Remove duplicates while keeping the highest score
+    unique_entities = {}
+    for entity in entities:
+        key = (entity['text'].lower(), entity['entity'])
+        if key not in unique_entities or entity['score'] > unique_entities[key]['score']:
+            unique_entities[key] = entity
+    
+    return sorted(list(unique_entities.values()), key=lambda x: x['score'], reverse=True)
 
-@app.post("/analyze_document")
-async def analyze_document(file: UploadFile = File(...)):
-    if not file:
-        raise HTTPException(status_code=400, detail="No file provided")
-    
-    if not allowed_file(file.filename):
-        raise HTTPException(status_code=400, detail="File type not allowed")
-    
-    try:
-        # Save the uploaded file
-        file_path = os.path.join("uploads", file.filename)
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # Process the document based on its type
-        if file.filename.endswith('.pdf'):
-            text = processor.extract_text_from_pdf(file_path)
-        elif file.filename.endswith('.docx'):
-            text = processor.extract_text_from_docx(file_path)
-        else:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-        
-        # Clean up the uploaded file
-        os.remove(file_path)
-        
-        # Analyze the extracted text
-        return await analyze_text(TextRequest(text=text))
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.route('/')
+def home():
+    return render_template('index.html')
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    text = request.json.get('text', '')
+    results = extract_financial_entities(text)
+    return jsonify(results)
+
+if __name__ == '__main__':
+    app.run(debug=True)

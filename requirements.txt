@@ -9,5 +9,9 @@ python-docx
 PyPDF2
 datasets
 scikit-learn
-nltk
-python-multipart
+chromadb
+langchain
+pandas
+numpy
+tqdm
+spacy
