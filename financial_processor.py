@@ -2,7 +2,7 @@ import os
 import PyPDF2
 import docx
 from typing import Dict, Any, List
-from transformers import pipeline
+from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import torch
@@ -26,11 +26,11 @@ class FinancialDocumentProcessor:
         self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
         
         # Initialize financial sentiment classifier
-        self.sentiment_model = torch.hub.load("yiyanghkust/finbert-tone", map_location=torch.device('cuda'))
-        self.sentiment_tokenizer = torch.hub.load("yiyanghkust/finbert-tone", map_location=torch.device('cuda'))
+        self.sentiment_model = AutoModelForSequenceClassification.from_pretrained("yiyanghkust/finbert-tone")
+        self.sentiment_tokenizer = AutoTokenizer.from_pretrained("yiyanghkust/finbert-tone")
         
-        # Initialize Chroma vector store
-        self.chroma_client = chromadb.Client()
+        # Initialize Chroma vector store (persistent)
+        self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
         self.collection = self.chroma_client.create_collection("financial_documents")
         
         # Initialize text splitter for RAG
@@ -128,16 +128,16 @@ class FinancialDocumentProcessor:
                 query_embeddings=[query_embedding],
                 n_results=k
             )
-            return results
+            return results.get('documents', [])  # Ensure it returns a list
         except Exception as e:
-            return {'error': str(e)}
+            return []
     
     def _extract_text(self, file_path: str) -> str:
         """Extract text from PDF or DOCX files."""
         if file_path.endswith('.pdf'):
             with open(file_path, 'rb') as file:
                 reader = PyPDF2.PdfReader(file)
-                text = ' '.join([page.extract_text() for page in reader.pages])
+                text = ' '.join([page.extract_text() or '' for page in reader.pages])
         elif file_path.endswith('.docx'):
             doc = docx.Document(file_path)
             text = ' '.join([paragraph.text for paragraph in doc.paragraphs])
@@ -165,34 +165,3 @@ class FinancialDocumentProcessor:
                 })
         
         return classified_sections
-    
-    def _extract_financial_metrics(self, text: str) -> Dict[str, Any]:
-        """Extract key financial metrics using spaCy's pattern matching."""
-        doc = self.nlp(text)
-        metrics = {
-            'currency_amounts': [],
-            'percentages': [],
-            'dates': []
-        }
-        
-        for ent in doc.ents:
-            if ent.label_ == 'MONEY':
-                metrics['currency_amounts'].append(ent.text)
-            elif ent.label_ == 'PERCENT':
-                metrics['percentages'].append(ent.text)
-            elif ent.label_ == 'DATE':
-                metrics['dates'].append(ent.text)
-        
-        return metrics
-    
-    def _analyze_sentiment(self, text: str) -> Dict[str, float]:
-        """Analyze financial sentiment of the text."""
-        inputs = self.sentiment_tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-        outputs = self.sentiment_model(**inputs)
-        probabilities = torch.softmax(outputs.logits, dim=1)
-        
-        return {
-            'positive': float(probabilities[0][0]),
-            'negative': float(probabilities[0][1]),
-            'neutral': float(probabilities[0][2])
-        }
